@@ -1,10 +1,9 @@
-use backon::{ExponentialBuilder, Retryable};
+use backon::{BackoffBuilder, ExponentialBuilder};
 use bon::bon;
-use reqwest::header::{CONTENT_TYPE, HeaderMap};
-use reqwest::{Client, Method, Response};
+use reqwest::header::{ACCEPT, CONTENT_TYPE, HeaderMap, RETRY_AFTER};
+use reqwest::{Client, Method, Response, StatusCode};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use tracing::{debug, instrument, warn};
 use url::Url;
@@ -14,7 +13,7 @@ use crate::retry::RetryPolicy;
 
 const DEFAULT_MAX_RESPONSE_BYTES: usize = 10 * 1024 * 1024;
 const DEFAULT_POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
-const DEFAULT_POOL_MAX_IDLE_PER_HOST: usize = usize::MAX;
+const DEFAULT_POOL_MAX_IDLE_PER_HOST: usize = 64;
 const ERROR_BODY_PREVIEW_BYTES: usize = 8 * 1024;
 const TRUNCATED_BODY_SUFFIX: &str = "... [truncated]";
 
@@ -33,6 +32,14 @@ pub struct HttpClient {
     pool_max_idle_per_host: usize,
 }
 
+const _: () = {
+    fn assert_send_sync<T: Send + Sync>() {}
+    fn check() {
+        assert_send_sync::<HttpClient>();
+    }
+};
+
+#[must_use = "request is not sent until .send() is called"]
 pub struct RequestBuilder<'a> {
     client: &'a HttpClient,
     method: Method,
@@ -54,9 +61,18 @@ impl HttpClient {
         #[builder(default = Duration::from_secs(5))] connect_timeout: Duration,
         #[builder(default = Duration::from_secs(30))] request_timeout: Duration,
     ) -> Self {
+        let scheme = base_url.scheme();
+        assert!(
+            scheme == "https" || scheme == "http",
+            "base_url must use http or https scheme, got: {scheme}"
+        );
+
         let base_url = Self::normalize_base_url(base_url);
+        let mut headers = default_headers;
+        headers.entry(ACCEPT).or_insert("application/json".parse().unwrap());
+
         let builder = Client::builder()
-            .default_headers(default_headers)
+            .default_headers(headers)
             .redirect(reqwest::redirect::Policy::none())
             .pool_idle_timeout(pool_idle_timeout)
             .pool_max_idle_per_host(pool_max_idle_per_host)
@@ -114,26 +130,47 @@ impl HttpClient {
             return operation().await;
         };
 
-        let backoff = ExponentialBuilder::default()
+        let mut backoff = ExponentialBuilder::default()
             .with_jitter()
             .with_min_delay(policy.base_delay())
             .with_max_delay(policy.max_delay())
-            .with_max_times(policy.max_attempts().get().saturating_sub(1) as usize);
-        let retry_count = AtomicUsize::new(0);
+            .build();
 
-        operation
-            .retry(backoff)
-            .when(|err| policy.is_retryable(err))
-            .notify(|err, dur| {
-                let retry = retry_count.fetch_add(1, Ordering::Relaxed) + 1;
-                warn!(
-                    retry,
-                    delay_ms = dur.as_millis() as u64,
-                    error = %err,
-                    "request failed, scheduling retry"
-                );
-            })
-            .await
+        let max_attempts = policy.max_attempts().get() as usize;
+
+        let mut last_err = operation().await.err();
+        for attempt in 1..max_attempts {
+            let err = match last_err.take() {
+                Some(err) if policy.is_retryable(&err) => err,
+                Some(err) => return Err(err),
+                None => unreachable!(),
+            };
+
+            let backoff_delay = backoff.next().unwrap_or(policy.max_delay());
+            let delay = match &err {
+                HttpClientError::ApiError {
+                    retry_after: Some(retry_after),
+                    ..
+                } => backoff_delay.max(*retry_after),
+                _ => backoff_delay,
+            };
+
+            warn!(
+                retry = attempt,
+                delay_ms = delay.as_millis() as u64,
+                error = %err,
+                "request failed, scheduling retry"
+            );
+
+            tokio::time::sleep(delay).await;
+
+            match operation().await {
+                Ok(result) => return Ok(result),
+                Err(err) => last_err = Some(err),
+            }
+        }
+
+        Err(last_err.unwrap())
     }
 
     async fn handle_json_response<R: DeserializeOwned>(
@@ -143,11 +180,17 @@ impl HttpClient {
         let status = response.status();
 
         if !status.is_success() {
+            let retry_after = if status == StatusCode::TOO_MANY_REQUESTS {
+                Self::parse_retry_after(&response)
+            } else {
+                None
+            };
             let body = Self::read_error_body_preview(response, max_response_bytes).await?;
             warn!(status = %status, "received non-success HTTP response");
             return Err(HttpClientError::ApiError {
                 status,
                 body,
+                retry_after,
             });
         }
 
@@ -334,6 +377,12 @@ impl HttpClient {
         }
 
         Ok(preview)
+    }
+
+    fn parse_retry_after(response: &Response) -> Option<Duration> {
+        let value = response.headers().get(RETRY_AFTER)?;
+        let secs: u64 = value.to_str().ok()?.trim().parse().ok()?;
+        Some(Duration::from_secs(secs))
     }
 
     fn truncate_incomplete_utf8_suffix(bytes: &mut Vec<u8>) {
@@ -589,5 +638,12 @@ mod tests {
         HttpClient::truncate_incomplete_utf8_suffix(&mut bytes);
 
         assert_eq!(bytes, b"za");
+    }
+
+    #[test]
+    #[should_panic(expected = "base_url must use http or https scheme")]
+    fn rejects_non_http_scheme() {
+        let base = Url::parse("ftp://example.com").unwrap();
+        HttpClient::builder().base_url(base).build();
     }
 }

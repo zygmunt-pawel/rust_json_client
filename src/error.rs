@@ -26,7 +26,11 @@ pub enum HttpClientError {
     // avoiding unbounded buffering and reducing the chance of dumping large
     // upstream payloads straight into logs.
     #[error("API error (status {status}): {body}")]
-    ApiError { status: StatusCode, body: String },
+    ApiError {
+        status: StatusCode,
+        body: String,
+        retry_after: Option<std::time::Duration>,
+    },
 
     #[error("response body exceeded limit ({received} > {limit} bytes)")]
     ResponseTooLarge { limit: usize, received: usize },

@@ -88,10 +88,12 @@ mod tests {
         let retryable = HttpClientError::ApiError {
             status: StatusCode::SERVICE_UNAVAILABLE,
             body: String::new(),
+            retry_after: None,
         };
         let not_retryable = HttpClientError::ApiError {
             status: StatusCode::BAD_REQUEST,
             body: String::new(),
+            retry_after: None,
         };
 
         assert!(policy.is_retryable(&retryable));

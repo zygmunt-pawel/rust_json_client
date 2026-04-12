@@ -9,6 +9,7 @@ Opinionated async HTTP client for JSON APIs built on top of [reqwest](https://do
 - Automatic retries with exponential backoff and jitter (powered by [backon](https://docs.rs/backon))
 - GET retries inherited from client policy, POST retries opt-in per request
 - Configurable retryable status codes (429, 500, 502, 503, 504 by default)
+- Respects `Retry-After` header on 429 responses (uses `max(retry_after, backoff)`)
 - Retries on transient transport errors (timeouts, connection failures)
 - Configurable response size limits with streaming enforcement (default 10 MB)
 - Truncated error body preview for non-success responses (max 8 KB)
@@ -16,9 +17,13 @@ Opinionated async HTTP client for JSON APIs built on top of [reqwest](https://do
 - Base URL normalization with path prefix preservation
 - Path traversal protection (rejects `..`, `.`, absolute URLs, fragments)
 - Redirects disabled by default (safe for API clients)
+- Default `Accept: application/json` header (overridable via `default_headers`)
+- Scheme validation on `base_url` (only `http` and `https` accepted)
+- `#[must_use]` on `RequestBuilder` — warns if `.send()` is not called
+- `Send + Sync` compile-time guarantee on `HttpClient`
 - Default headers support
 - Configurable connect/request timeouts (5s / 30s defaults)
-- Configurable connection pool (idle timeout, max idle per host)
+- Configurable connection pool (idle timeout, max idle per host — default 64)
 - TLS via rustls (no OpenSSL dependency)
 - HTTP/2 support
 - Structured logging via [tracing](https://docs.rs/tracing) with `#[instrument]` spans
@@ -128,7 +133,7 @@ let result: Result<serde_json::Value, HttpClientError> = client
 
 match result {
     Ok(response) => println!("ok: {response:?}"),
-    Err(HttpClientError::ApiError { status: StatusCode::CONFLICT, body }) => {
+    Err(HttpClientError::ApiError { status: StatusCode::CONFLICT, body, .. }) => {
         eprintln!("already exists: {body}");
     }
     Err(HttpClientError::ResponseTooLarge { limit, received }) => {

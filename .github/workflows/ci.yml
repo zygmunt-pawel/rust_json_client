@@ -10,13 +10,41 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  test:
+  fmt:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        toolchain: [stable, nightly]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.toolchain }}
       - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.toolchain }}
       - run: cargo test --all-targets
+
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.85"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: msrv
+      - run: cargo check --all-targets
 
   clippy:
     runs-on: ubuntu-latest
@@ -27,3 +55,11 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --all-targets -- -D warnings
+
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}

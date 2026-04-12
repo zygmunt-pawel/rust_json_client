@@ -77,6 +77,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Err(HttpClientError::ApiError {
             status: StatusCode::CONFLICT,
             body,
+            ..
         }) => {
             eprintln!("job already exists: {body}");
             Ok(())

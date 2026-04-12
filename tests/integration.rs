@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use wiremock::matchers::{body_json, method, path};
+use wiremock::matchers::{body_json, header, method, path};
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
 #[derive(Serialize)]
@@ -182,7 +182,7 @@ async fn api_error_body_is_truncated_to_preview() {
         client.get("/large-error").send().await;
 
     match result {
-        Err(HttpClientError::ApiError { status, body }) => {
+        Err(HttpClientError::ApiError { status, body, .. }) => {
             assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
             assert!(body.len() < large_error_body.len());
             assert!(body.ends_with("... [truncated]"));
@@ -540,4 +540,108 @@ async fn post_retries_when_explicit_retry_policy_is_provided() {
 
     assert_eq!(response["status"], "accepted");
     assert_eq!(attempts.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn requests_include_accept_json_header() {
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/accept"))
+        .and(header("accept", "application/json"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "ok": true
+        })))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let client = HttpClient::builder()
+        .base_url(url::Url::parse(&mock_server.uri()).unwrap())
+        .build();
+
+    let response: serde_json::Value = client.get("/accept").send().await.unwrap();
+    assert_eq!(response["ok"], true);
+}
+
+#[tokio::test]
+async fn retry_respects_retry_after_header() {
+    let mock_server = MockServer::start().await;
+    let attempts = Arc::new(AtomicUsize::new(0));
+
+    Mock::given(method("GET"))
+        .and(path("/rate-limited"))
+        .respond_with({
+            let attempts = attempts.clone();
+            move |_request: &Request| {
+                let attempt = attempts.fetch_add(1, Ordering::SeqCst);
+
+                if attempt == 0 {
+                    ResponseTemplate::new(429)
+                        .insert_header("retry-after", "1")
+                        .set_body_string("rate limited")
+                } else {
+                    ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                        "url": "ok"
+                    }))
+                }
+            }
+        })
+        .expect(2)
+        .mount(&mock_server)
+        .await;
+
+    let retry_policy = rust_json_client::RetryPolicy::builder()
+        .max_attempts(NonZeroU32::new(2).unwrap())
+        .base_delay(std::time::Duration::from_millis(10))
+        .build();
+
+    let client = HttpClient::builder()
+        .base_url(url::Url::parse(&mock_server.uri()).unwrap())
+        .retry_policy(retry_policy)
+        .build();
+
+    let start = std::time::Instant::now();
+    let response: HttpBinGetResponse = client.get("/rate-limited").send().await.unwrap();
+    let elapsed = start.elapsed();
+
+    assert_eq!(response.url, "ok");
+    assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    // Retry-After: 1 means we should have waited at least 1 second
+    assert!(elapsed >= std::time::Duration::from_millis(900));
+}
+
+#[tokio::test]
+async fn retry_after_is_exposed_in_api_error() {
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/rate-limited-no-retry"))
+        .respond_with(
+            ResponseTemplate::new(429)
+                .insert_header("retry-after", "30")
+                .set_body_string("rate limited"),
+        )
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let client = HttpClient::builder()
+        .base_url(url::Url::parse(&mock_server.uri()).unwrap())
+        .build();
+
+    let result: Result<serde_json::Value, HttpClientError> =
+        client.get("/rate-limited-no-retry").send().await;
+
+    match result {
+        Err(HttpClientError::ApiError {
+            status,
+            retry_after,
+            ..
+        }) => {
+            assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+            assert_eq!(retry_after, Some(std::time::Duration::from_secs(30)));
+        }
+        other => panic!("expected ApiError with retry_after, got {other:?}"),
+    }
 }
