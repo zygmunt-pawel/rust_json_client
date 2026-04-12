@@ -1,5 +1,5 @@
-use rust_json_client::{HttpClient, HttpClientError};
 use reqwest::StatusCode;
+use rust_json_client::{HttpClient, HttpClientError};
 use serde::{Deserialize, Serialize};
 use std::num::NonZeroU32;
 use std::sync::Arc;
@@ -419,10 +419,10 @@ async fn get_does_not_follow_redirects_to_other_hosts() {
 
     Mock::given(method("GET"))
         .and(path("/redirect"))
-        .respond_with(
-            ResponseTemplate::new(302)
-                .insert_header("location", format!("{}/redirect-target", target_server.uri())),
-        )
+        .respond_with(ResponseTemplate::new(302).insert_header(
+            "location",
+            format!("{}/redirect-target", target_server.uri()),
+        ))
         .expect(1)
         .mount(&source_server)
         .await;

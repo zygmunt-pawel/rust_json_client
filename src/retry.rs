@@ -34,8 +34,9 @@ impl RetryPolicy {
         max_attempts: NonZeroU32,
         #[builder(default = Duration::from_secs(1))] base_delay: Duration,
         #[builder(default = Duration::from_secs(30))] max_delay: Duration,
-        #[builder(default = DEFAULT_RETRYABLE_STATUS_CODES.to_vec())]
-        retryable_status_codes: Vec<StatusCode>,
+        #[builder(default = DEFAULT_RETRYABLE_STATUS_CODES.to_vec())] retryable_status_codes: Vec<
+            StatusCode,
+        >,
     ) -> Self {
         Self {
             max_attempts,
@@ -73,7 +74,10 @@ mod tests {
         assert_eq!(policy.max_attempts().get(), 3);
         assert_eq!(policy.base_delay(), Duration::from_secs(1));
         assert_eq!(policy.max_delay(), Duration::from_secs(30));
-        assert_eq!(policy.retryable_status_codes(), &DEFAULT_RETRYABLE_STATUS_CODES);
+        assert_eq!(
+            policy.retryable_status_codes(),
+            &DEFAULT_RETRYABLE_STATUS_CODES
+        );
     }
 
     #[test]

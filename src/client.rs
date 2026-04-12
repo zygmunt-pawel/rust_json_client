@@ -33,7 +33,9 @@ pub struct HttpClient {
 }
 
 const _: () = {
+    #[allow(dead_code)]
     fn assert_send_sync<T: Send + Sync>() {}
+    #[allow(dead_code)]
     fn check() {
         assert_send_sync::<HttpClient>();
     }
@@ -69,7 +71,9 @@ impl HttpClient {
 
         let base_url = Self::normalize_base_url(base_url);
         let mut headers = default_headers;
-        headers.entry(ACCEPT).or_insert("application/json".parse().unwrap());
+        headers
+            .entry(ACCEPT)
+            .or_insert("application/json".parse().unwrap());
 
         let builder = Client::builder()
             .default_headers(headers)
@@ -326,8 +330,7 @@ impl HttpClient {
             if received > max_response_bytes {
                 warn!(
                     limit = max_response_bytes,
-                    received,
-                    "streamed response exceeded configured size limit"
+                    received, "streamed response exceeded configured size limit"
                 );
                 return Err(HttpClientError::ResponseTooLarge {
                     limit: max_response_bytes,
