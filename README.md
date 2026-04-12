@@ -4,12 +4,25 @@ Opinionated async HTTP client for JSON APIs built on top of [reqwest](https://do
 
 ## Features
 
-- Builder pattern via [bon](https://docs.rs/bon)
-- Automatic retries with exponential backoff (powered by [backon](https://docs.rs/backon))
-- Configurable response size limits
-- Structured logging via [tracing](https://docs.rs/tracing)
-- Path traversal protection
-- No redirect following (safe for API clients)
+- Builder pattern for client and retry policy via [bon](https://docs.rs/bon)
+- GET and POST with automatic JSON serialization/deserialization
+- Automatic retries with exponential backoff and jitter (powered by [backon](https://docs.rs/backon))
+- GET retries inherited from client policy, POST retries opt-in per request
+- Configurable retryable status codes (429, 500, 502, 503, 504 by default)
+- Retries on transient transport errors (timeouts, connection failures)
+- Configurable response size limits with streaming enforcement (default 10 MB)
+- Truncated error body preview for non-success responses (max 8 KB)
+- Safe handling of empty/whitespace-only response bodies (`()` and `Option<T>`)
+- Base URL normalization with path prefix preservation
+- Path traversal protection (rejects `..`, `.`, absolute URLs, fragments)
+- Redirects disabled by default (safe for API clients)
+- Default headers support
+- Configurable connect/request timeouts (5s / 30s defaults)
+- Configurable connection pool (idle timeout, max idle per host)
+- TLS via rustls (no OpenSSL dependency)
+- HTTP/2 support
+- Structured logging via [tracing](https://docs.rs/tracing) with `#[instrument]` spans
+- UTF-8 safe truncation of error body previews
 
 ## Installation
 
