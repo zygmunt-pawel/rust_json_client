@@ -28,7 +28,7 @@ Opinionated async HTTP client for JSON APIs built on top of [reqwest](https://do
 
 ```toml
 [dependencies]
-rust_json_client = { git = "https://github.com/zygmunt-pawel/rust_json_client.git" }
+rust_json_client = { git = "https://github.com/zygmunt-pawel/rust_json_client.git", tag = "v0.1.0" }
 ```
 
 ## Usage
