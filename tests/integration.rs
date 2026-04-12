@@ -690,3 +690,269 @@ async fn send_sse_collects_all_chunks() {
     assert_eq!(chunks[1].id, 2);
     assert_eq!(chunks[1].text, "world");
 }
+
+#[tokio::test]
+async fn send_sse_returns_empty_vec_on_immediate_done() {
+    let mock_server = MockServer::start().await;
+
+    let sse_body = "data: [DONE]\n\n";
+
+    Mock::given(method("POST"))
+        .and(path("/stream-empty"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(sse_body),
+        )
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let client = HttpClient::builder()
+        .base_url(url::Url::parse(&mock_server.uri()).unwrap())
+        .build();
+
+    let payload = serde_json::json!({"stream": true});
+    let chunks: Vec<SseChunk> = client
+        .post("/stream-empty", &payload)
+        .unwrap()
+        .send_sse()
+        .await
+        .unwrap();
+
+    assert!(chunks.is_empty());
+}
+
+#[tokio::test]
+async fn send_sse_ignores_comments_and_unknown_fields() {
+    let mock_server = MockServer::start().await;
+
+    let sse_body = "\
+        : this is a comment\n\
+        data: {\"id\":1,\"text\":\"kept\"}\n\n\
+        event: heartbeat\n\
+        : another comment\n\
+        data: {\"id\":2,\"text\":\"also kept\"}\n\n\
+        data: [DONE]\n\n";
+
+    Mock::given(method("POST"))
+        .and(path("/stream-comments"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(sse_body),
+        )
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let client = HttpClient::builder()
+        .base_url(url::Url::parse(&mock_server.uri()).unwrap())
+        .build();
+
+    let payload = serde_json::json!({"stream": true});
+    let chunks: Vec<SseChunk> = client
+        .post("/stream-comments", &payload)
+        .unwrap()
+        .send_sse()
+        .await
+        .unwrap();
+
+    assert_eq!(chunks.len(), 2);
+    assert_eq!(chunks[0].text, "kept");
+    assert_eq!(chunks[1].text, "also kept");
+}
+
+#[tokio::test]
+async fn send_sse_returns_api_error_on_non_success_status() {
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/stream-error"))
+        .respond_with(ResponseTemplate::new(401).set_body_string("unauthorized"))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let client = HttpClient::builder()
+        .base_url(url::Url::parse(&mock_server.uri()).unwrap())
+        .build();
+
+    let payload = serde_json::json!({"stream": true});
+    let result: Result<Vec<SseChunk>, HttpClientError> = client
+        .post("/stream-error", &payload)
+        .unwrap()
+        .send_sse()
+        .await;
+
+    assert!(matches!(
+        result,
+        Err(HttpClientError::ApiError {
+            status: StatusCode::UNAUTHORIZED,
+            ..
+        })
+    ));
+}
+
+#[tokio::test]
+async fn send_sse_retries_on_transient_error() {
+    let mock_server = MockServer::start().await;
+    let attempts = Arc::new(AtomicUsize::new(0));
+
+    Mock::given(method("POST"))
+        .and(path("/stream-retry"))
+        .respond_with({
+            let attempts = attempts.clone();
+            move |_request: &Request| {
+                let attempt = attempts.fetch_add(1, Ordering::SeqCst);
+
+                if attempt == 0 {
+                    ResponseTemplate::new(503).set_body_string("temporary failure")
+                } else {
+                    ResponseTemplate::new(200)
+                        .insert_header("content-type", "text/event-stream")
+                        .set_body_string(
+                            "data: {\"id\":1,\"text\":\"recovered\"}\n\ndata: [DONE]\n\n",
+                        )
+                }
+            }
+        })
+        .expect(2)
+        .mount(&mock_server)
+        .await;
+
+    let retry_policy = rust_json_client::RetryPolicy::builder()
+        .max_attempts(NonZeroU32::new(2).unwrap())
+        .base_delay(std::time::Duration::from_millis(10))
+        .build();
+
+    let client = HttpClient::builder()
+        .base_url(url::Url::parse(&mock_server.uri()).unwrap())
+        .build();
+
+    let payload = serde_json::json!({"stream": true});
+    let chunks: Vec<SseChunk> = client
+        .post("/stream-retry", &payload)
+        .unwrap()
+        .with_retry(retry_policy)
+        .send_sse()
+        .await
+        .unwrap();
+
+    assert_eq!(chunks.len(), 1);
+    assert_eq!(chunks[0].text, "recovered");
+    assert_eq!(attempts.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn send_sse_returns_deserialization_error_on_bad_json() {
+    let mock_server = MockServer::start().await;
+
+    let sse_body = "\
+        data: {\"id\":1,\"text\":\"ok\"}\n\n\
+        data: {not valid json}\n\n\
+        data: [DONE]\n\n";
+
+    Mock::given(method("POST"))
+        .and(path("/stream-bad-json"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(sse_body),
+        )
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let client = HttpClient::builder()
+        .base_url(url::Url::parse(&mock_server.uri()).unwrap())
+        .build();
+
+    let payload = serde_json::json!({"stream": true});
+    let result: Result<Vec<SseChunk>, HttpClientError> = client
+        .post("/stream-bad-json", &payload)
+        .unwrap()
+        .send_sse()
+        .await;
+
+    assert!(matches!(
+        result,
+        Err(HttpClientError::DeserializationError(_))
+    ));
+}
+
+#[tokio::test]
+async fn send_sse_enforces_max_response_bytes() {
+    let mock_server = MockServer::start().await;
+
+    let large_text = "x".repeat(512);
+    let sse_body = format!(
+        "data: {{\"id\":1,\"text\":\"{large_text}\"}}\n\n\
+         data: {{\"id\":2,\"text\":\"{large_text}\"}}\n\n\
+         data: [DONE]\n\n"
+    );
+
+    Mock::given(method("POST"))
+        .and(path("/stream-large"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(sse_body),
+        )
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let client = HttpClient::builder()
+        .base_url(url::Url::parse(&mock_server.uri()).unwrap())
+        .max_response_bytes(256)
+        .build();
+
+    let payload = serde_json::json!({"stream": true});
+    let result: Result<Vec<SseChunk>, HttpClientError> = client
+        .post("/stream-large", &payload)
+        .unwrap()
+        .send_sse()
+        .await;
+
+    assert!(matches!(
+        result,
+        Err(HttpClientError::ResponseTooLarge { limit: 256, .. })
+    ));
+}
+
+#[tokio::test]
+async fn send_sse_returns_chunks_when_stream_ends_without_done() {
+    let mock_server = MockServer::start().await;
+
+    let sse_body = "\
+        data: {\"id\":1,\"text\":\"first\"}\n\n\
+        data: {\"id\":2,\"text\":\"second\"}\n\n";
+
+    Mock::given(method("POST"))
+        .and(path("/stream-no-done"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(sse_body),
+        )
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let client = HttpClient::builder()
+        .base_url(url::Url::parse(&mock_server.uri()).unwrap())
+        .build();
+
+    let payload = serde_json::json!({"stream": true});
+    let chunks: Vec<SseChunk> = client
+        .post("/stream-no-done", &payload)
+        .unwrap()
+        .send_sse()
+        .await
+        .unwrap();
+
+    assert_eq!(chunks.len(), 2);
+    assert_eq!(chunks[0].text, "first");
+    assert_eq!(chunks[1].text, "second");
+}
