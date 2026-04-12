@@ -36,7 +36,7 @@ jobs:
 
       - name: Create PR
         if: steps.check.outputs.outdated == 'true'
-        uses: peter-evans/create-pull-request@v7
+        uses: peter-evans/create-pull-request@v8
         with:
           branch: update-msrv-${{ steps.check.outputs.latest }}
           title: "deps: bump MSRV to ${{ steps.check.outputs.latest }}"
