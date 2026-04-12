@@ -179,10 +179,10 @@ impl HttpClient {
         Err(last_err.unwrap())
     }
 
-    async fn handle_json_response<R: DeserializeOwned>(
+    async fn check_error_status(
         response: Response,
         max_response_bytes: usize,
-    ) -> Result<R, HttpClientError> {
+    ) -> Result<Response, HttpClientError> {
         let status = response.status();
 
         if !status.is_success() {
@@ -199,6 +199,16 @@ impl HttpClient {
                 retry_after,
             });
         }
+
+        Ok(response)
+    }
+
+    async fn handle_json_response<R: DeserializeOwned>(
+        response: Response,
+        max_response_bytes: usize,
+    ) -> Result<R, HttpClientError> {
+        let response = Self::check_error_status(response, max_response_bytes).await?;
+        let status = response.status();
 
         if let Some(content_length) = response.content_length()
             && content_length > max_response_bytes as u64
@@ -222,30 +232,14 @@ impl HttpClient {
     }
 
     async fn handle_sse_response<R: DeserializeOwned>(
-        response: Response,
+        mut response: Response,
         max_response_bytes: usize,
     ) -> Result<Vec<R>, HttpClientError> {
-        let status = response.status();
-
-        if !status.is_success() {
-            let retry_after = if status == StatusCode::TOO_MANY_REQUESTS {
-                Self::parse_retry_after(&response)
-            } else {
-                None
-            };
-            let body = Self::read_error_body_preview(response, max_response_bytes).await?;
-            warn!(status = %status, "received non-success HTTP response");
-            return Err(HttpClientError::ApiError {
-                status,
-                body,
-                retry_after,
-            });
-        }
+        response = Self::check_error_status(response, max_response_bytes).await?;
 
         let mut chunks = Vec::new();
         let mut line_buf = String::new();
         let mut received = 0usize;
-        let mut response = response;
 
         while let Some(chunk) = response.chunk().await? {
             received += chunk.len();
@@ -264,40 +258,20 @@ impl HttpClient {
             let text = String::from_utf8_lossy(&chunk);
             line_buf.push_str(&text);
 
-            while let Some(newline_pos) = line_buf.find('\n') {
-                let line: String = line_buf.drain(..=newline_pos).collect();
-                let line = line.trim();
-
-                if line.is_empty() {
-                    continue;
-                }
-
-                if line.starts_with(':') {
-                    continue;
-                }
-
-                let Some(data) = line
-                    .strip_prefix("data: ")
-                    .or_else(|| line.strip_prefix("data:"))
-                else {
-                    continue;
-                };
-
-                let data = data.trim();
-
-                if data == "[DONE]" {
-                    debug!(
-                        chunks = chunks.len(),
-                        bytes = received,
-                        "SSE stream received [DONE]"
-                    );
-                    return Ok(chunks);
-                }
-
-                let parsed: R =
-                    serde_json::from_str(data).map_err(HttpClientError::DeserializationError)?;
-                chunks.push(parsed);
+            if Self::process_sse_lines(&mut line_buf, &mut chunks)? {
+                debug!(
+                    chunks = chunks.len(),
+                    bytes = received,
+                    "SSE stream received [DONE]"
+                );
+                return Ok(chunks);
             }
+        }
+
+        // Process any remaining data in the buffer (last line without trailing \n).
+        if !line_buf.is_empty() {
+            line_buf.push('\n');
+            Self::process_sse_lines(&mut line_buf, &mut chunks)?;
         }
 
         debug!(
@@ -306,6 +280,44 @@ impl HttpClient {
             "SSE stream ended without [DONE]"
         );
         Ok(chunks)
+    }
+
+    /// Parses complete lines from `line_buf`, deserializes `data:` payloads into
+    /// `chunks`, and returns `Ok(true)` when the `[DONE]` sentinel is encountered.
+    fn process_sse_lines<R: DeserializeOwned>(
+        line_buf: &mut String,
+        chunks: &mut Vec<R>,
+    ) -> Result<bool, HttpClientError> {
+        while let Some(newline_pos) = line_buf.find('\n') {
+            let line = line_buf[..newline_pos].trim();
+
+            if line.is_empty() || line.starts_with(':') {
+                line_buf.drain(..=newline_pos);
+                continue;
+            }
+
+            let Some(data) = line
+                .strip_prefix("data: ")
+                .or_else(|| line.strip_prefix("data:"))
+            else {
+                line_buf.drain(..=newline_pos);
+                continue;
+            };
+
+            let data = data.trim();
+
+            if data == "[DONE]" {
+                line_buf.drain(..=newline_pos);
+                return Ok(true);
+            }
+
+            let parsed: R =
+                serde_json::from_str(data).map_err(HttpClientError::DeserializationError)?;
+            chunks.push(parsed);
+            line_buf.drain(..=newline_pos);
+        }
+
+        Ok(false)
     }
 
     fn deserialize_success_body<R: DeserializeOwned>(bytes: &[u8]) -> Result<R, HttpClientError> {

@@ -956,3 +956,126 @@ async fn send_sse_returns_chunks_when_stream_ends_without_done() {
     assert_eq!(chunks[0].text, "first");
     assert_eq!(chunks[1].text, "second");
 }
+
+#[tokio::test]
+async fn send_sse_collects_last_chunk_without_trailing_newline() {
+    let mock_server = MockServer::start().await;
+
+    // Last data line has no trailing \n — simulates server closing connection abruptly.
+    let sse_body = "data: {\"id\":1,\"text\":\"first\"}\n\ndata: {\"id\":2,\"text\":\"last\"}";
+
+    Mock::given(method("POST"))
+        .and(path("/stream-no-trailing-newline"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(sse_body),
+        )
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let client = HttpClient::builder()
+        .base_url(url::Url::parse(&mock_server.uri()).unwrap())
+        .build();
+
+    let payload = serde_json::json!({"stream": true});
+    let chunks: Vec<SseChunk> = client
+        .post("/stream-no-trailing-newline", &payload)
+        .unwrap()
+        .send_sse()
+        .await
+        .unwrap();
+
+    assert_eq!(chunks.len(), 2);
+    assert_eq!(chunks[0].text, "first");
+    assert_eq!(chunks[1].text, "last");
+}
+
+#[tokio::test]
+async fn send_sse_handles_data_prefix_without_space() {
+    let mock_server = MockServer::start().await;
+
+    // Some SSE implementations use "data:{json}" without a space after the colon.
+    let sse_body = "data:{\"id\":1,\"text\":\"no-space\"}\n\ndata: [DONE]\n\n";
+
+    Mock::given(method("POST"))
+        .and(path("/stream-no-space"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(sse_body),
+        )
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let client = HttpClient::builder()
+        .base_url(url::Url::parse(&mock_server.uri()).unwrap())
+        .build();
+
+    let payload = serde_json::json!({"stream": true});
+    let chunks: Vec<SseChunk> = client
+        .post("/stream-no-space", &payload)
+        .unwrap()
+        .send_sse()
+        .await
+        .unwrap();
+
+    assert_eq!(chunks.len(), 1);
+    assert_eq!(chunks[0].text, "no-space");
+}
+
+#[tokio::test]
+async fn send_sse_respects_retry_after_on_429() {
+    let mock_server = MockServer::start().await;
+    let attempts = Arc::new(AtomicUsize::new(0));
+
+    Mock::given(method("POST"))
+        .and(path("/stream-rate-limited"))
+        .respond_with({
+            let attempts = attempts.clone();
+            move |_request: &Request| {
+                let attempt = attempts.fetch_add(1, Ordering::SeqCst);
+
+                if attempt == 0 {
+                    ResponseTemplate::new(429)
+                        .insert_header("retry-after", "1")
+                        .set_body_string("rate limited")
+                } else {
+                    ResponseTemplate::new(200)
+                        .insert_header("content-type", "text/event-stream")
+                        .set_body_string("data: {\"id\":1,\"text\":\"ok\"}\n\ndata: [DONE]\n\n")
+                }
+            }
+        })
+        .expect(2)
+        .mount(&mock_server)
+        .await;
+
+    let retry_policy = rust_json_client::RetryPolicy::builder()
+        .max_attempts(NonZeroU32::new(2).unwrap())
+        .base_delay(std::time::Duration::from_millis(10))
+        .build();
+
+    let client = HttpClient::builder()
+        .base_url(url::Url::parse(&mock_server.uri()).unwrap())
+        .build();
+
+    let payload = serde_json::json!({"stream": true});
+    let start = std::time::Instant::now();
+    let chunks: Vec<SseChunk> = client
+        .post("/stream-rate-limited", &payload)
+        .unwrap()
+        .with_retry(retry_policy)
+        .send_sse()
+        .await
+        .unwrap();
+    let elapsed = start.elapsed();
+
+    assert_eq!(chunks.len(), 1);
+    assert_eq!(chunks[0].text, "ok");
+    assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    // Retry-After: 1 means we should have waited at least 1 second
+    assert!(elapsed >= std::time::Duration::from_millis(900));
+}
