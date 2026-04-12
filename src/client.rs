@@ -81,7 +81,9 @@ impl HttpClient {
             .pool_idle_timeout(pool_idle_timeout)
             .pool_max_idle_per_host(pool_max_idle_per_host)
             .connect_timeout(connect_timeout)
-            .timeout(request_timeout);
+            .timeout(request_timeout)
+            .tcp_keepalive(Duration::from_secs(30))
+            .tcp_nodelay(true);
 
         // Fail fast during startup: in this monolith a broken reqwest/TLS setup is
         // considered a fatal environment problem rather than a recoverable user error.
@@ -217,6 +219,93 @@ impl HttpClient {
         let parsed = Self::deserialize_success_body(&bytes)?;
         debug!(status = %status, bytes = bytes.len(), "successfully decoded JSON response");
         Ok(parsed)
+    }
+
+    async fn handle_sse_response<R: DeserializeOwned>(
+        response: Response,
+        max_response_bytes: usize,
+    ) -> Result<Vec<R>, HttpClientError> {
+        let status = response.status();
+
+        if !status.is_success() {
+            let retry_after = if status == StatusCode::TOO_MANY_REQUESTS {
+                Self::parse_retry_after(&response)
+            } else {
+                None
+            };
+            let body = Self::read_error_body_preview(response, max_response_bytes).await?;
+            warn!(status = %status, "received non-success HTTP response");
+            return Err(HttpClientError::ApiError {
+                status,
+                body,
+                retry_after,
+            });
+        }
+
+        let mut chunks = Vec::new();
+        let mut line_buf = String::new();
+        let mut received = 0usize;
+        let mut response = response;
+
+        while let Some(chunk) = response.chunk().await? {
+            received += chunk.len();
+
+            if received > max_response_bytes {
+                warn!(
+                    limit = max_response_bytes,
+                    received, "SSE stream exceeded configured size limit"
+                );
+                return Err(HttpClientError::ResponseTooLarge {
+                    limit: max_response_bytes,
+                    received,
+                });
+            }
+
+            let text = String::from_utf8_lossy(&chunk);
+            line_buf.push_str(&text);
+
+            while let Some(newline_pos) = line_buf.find('\n') {
+                let line: String = line_buf.drain(..=newline_pos).collect();
+                let line = line.trim();
+
+                if line.is_empty() {
+                    continue;
+                }
+
+                if line.starts_with(':') {
+                    continue;
+                }
+
+                let Some(data) = line
+                    .strip_prefix("data: ")
+                    .or_else(|| line.strip_prefix("data:"))
+                else {
+                    continue;
+                };
+
+                let data = data.trim();
+
+                if data == "[DONE]" {
+                    debug!(
+                        chunks = chunks.len(),
+                        bytes = received,
+                        "SSE stream received [DONE]"
+                    );
+                    return Ok(chunks);
+                }
+
+                let parsed: R =
+                    serde_json::from_str(data).map_err(HttpClientError::DeserializationError)?;
+                chunks.push(parsed);
+            }
+        }
+
+        debug!(
+            chunks = chunks.len(),
+            bytes = received,
+            "SSE stream ended without [DONE]"
+        );
+        Ok(chunks)
     }
 
     fn deserialize_success_body<R: DeserializeOwned>(bytes: &[u8]) -> Result<R, HttpClientError> {
@@ -439,6 +528,47 @@ impl<'a> RequestBuilder<'a> {
         match &result {
             Ok(_) => debug!(elapsed_ms, "request completed successfully"),
             Err(err) => warn!(elapsed_ms, error = %err, "request failed"),
+        }
+
+        result
+    }
+
+    #[instrument(
+        name = "http_client.send_sse",
+        skip_all,
+        fields(
+            method = %self.method,
+            path = %HttpClient::loggable_path(self.path),
+            retry_enabled = self.retry_policy.is_some()
+        )
+    )]
+    pub async fn send_sse<R: DeserializeOwned>(self) -> Result<Vec<R>, HttpClientError> {
+        let retry_policy = self.retry_policy.as_ref();
+        let url = HttpClient::build_request_url(&self.client.base_url, self.path)?;
+        let started_at = Instant::now();
+        debug!("sending SSE request");
+
+        let result = self
+            .client
+            .execute_with_retry(retry_policy, || async {
+                let mut request = self.client.client.request(self.method.clone(), url.clone());
+
+                if let Some(body) = &self.json_body {
+                    request = request
+                        .header(CONTENT_TYPE, "application/json")
+                        .body(body.clone());
+                }
+
+                let response = request.send().await?;
+                HttpClient::handle_sse_response(response, self.client.max_response_bytes).await
+            })
+            .await;
+
+        let elapsed_ms = started_at.elapsed().as_millis() as u64;
+
+        match &result {
+            Ok(chunks) => debug!(elapsed_ms, chunks = chunks.len(), "SSE stream completed"),
+            Err(err) => warn!(elapsed_ms, error = %err, "SSE request failed"),
         }
 
         result

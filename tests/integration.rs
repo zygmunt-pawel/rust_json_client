@@ -645,3 +645,48 @@ async fn retry_after_is_exposed_in_api_error() {
         other => panic!("expected ApiError with retry_after, got {other:?}"),
     }
 }
+
+#[derive(Deserialize, Debug)]
+struct SseChunk {
+    id: u32,
+    text: String,
+}
+
+#[tokio::test]
+async fn send_sse_collects_all_chunks() {
+    let mock_server = MockServer::start().await;
+
+    let sse_body = "\
+        data: {\"id\":1,\"text\":\"hello\"}\n\n\
+        data: {\"id\":2,\"text\":\"world\"}\n\n\
+        data: [DONE]\n\n";
+
+    Mock::given(method("POST"))
+        .and(path("/stream"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(sse_body),
+        )
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let client = HttpClient::builder()
+        .base_url(url::Url::parse(&mock_server.uri()).unwrap())
+        .build();
+
+    let payload = serde_json::json!({"stream": true});
+    let chunks: Vec<SseChunk> = client
+        .post("/stream", &payload)
+        .unwrap()
+        .send_sse()
+        .await
+        .unwrap();
+
+    assert_eq!(chunks.len(), 2);
+    assert_eq!(chunks[0].id, 1);
+    assert_eq!(chunks[0].text, "hello");
+    assert_eq!(chunks[1].id, 2);
+    assert_eq!(chunks[1].text, "world");
+}
