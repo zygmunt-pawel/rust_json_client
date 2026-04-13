@@ -238,7 +238,7 @@ impl HttpClient {
         response = Self::check_error_status(response, max_response_bytes).await?;
 
         let mut chunks = Vec::new();
-        let mut line_buf = String::new();
+        let mut byte_buf: Vec<u8> = Vec::new();
         let mut received = 0usize;
 
         while let Some(chunk) = response.chunk().await? {
@@ -255,10 +255,9 @@ impl HttpClient {
                 });
             }
 
-            let text = String::from_utf8_lossy(&chunk);
-            line_buf.push_str(&text);
+            byte_buf.extend_from_slice(&chunk);
 
-            if Self::process_sse_lines(&mut line_buf, &mut chunks)? {
+            if Self::process_sse_byte_lines(&mut byte_buf, &mut chunks)? {
                 debug!(
                     chunks = chunks.len(),
                     bytes = received,
@@ -269,9 +268,9 @@ impl HttpClient {
         }
 
         // Process any remaining data in the buffer (last line without trailing \n).
-        if !line_buf.is_empty() {
-            line_buf.push('\n');
-            Self::process_sse_lines(&mut line_buf, &mut chunks)?;
+        if !byte_buf.is_empty() {
+            byte_buf.push(b'\n');
+            Self::process_sse_byte_lines(&mut byte_buf, &mut chunks)?;
         }
 
         debug!(
@@ -282,39 +281,50 @@ impl HttpClient {
         Ok(chunks)
     }
 
-    /// Parses complete lines from `line_buf`, deserializes `data:` payloads into
+    /// Parses complete lines from `byte_buf`, deserializes `data:` payloads into
     /// `chunks`, and returns `Ok(true)` when the `[DONE]` sentinel is encountered.
-    fn process_sse_lines<R: DeserializeOwned>(
-        line_buf: &mut String,
+    ///
+    /// Operates on raw bytes to avoid corrupting multi-byte UTF-8 characters that
+    /// may be split across network chunk boundaries. Only complete lines (delimited
+    /// by `\n`) are decoded to UTF-8.
+    fn process_sse_byte_lines<R: DeserializeOwned>(
+        byte_buf: &mut Vec<u8>,
         chunks: &mut Vec<R>,
     ) -> Result<bool, HttpClientError> {
-        while let Some(newline_pos) = line_buf.find('\n') {
-            let line = line_buf[..newline_pos].trim();
+        while let Some(newline_pos) = byte_buf.iter().position(|&b| b == b'\n') {
+            let line_bytes = &byte_buf[..newline_pos];
 
-            if line.is_empty() || line.starts_with(':') {
-                line_buf.drain(..=newline_pos);
+            // Trim \r for servers that send \r\n line endings.
+            let line_bytes = line_bytes.strip_suffix(b"\r").unwrap_or(line_bytes);
+
+            // Trim leading/trailing ASCII whitespace.
+            let line_bytes = line_bytes.trim_ascii();
+
+            if line_bytes.is_empty() || line_bytes[0] == b':' {
+                byte_buf.drain(..=newline_pos);
                 continue;
             }
 
-            let Some(data) = line
-                .strip_prefix("data: ")
-                .or_else(|| line.strip_prefix("data:"))
-            else {
-                line_buf.drain(..=newline_pos);
+            let data_bytes = if let Some(rest) = line_bytes.strip_prefix(b"data: ") {
+                rest
+            } else if let Some(rest) = line_bytes.strip_prefix(b"data:") {
+                rest
+            } else {
+                byte_buf.drain(..=newline_pos);
                 continue;
             };
 
-            let data = data.trim();
+            let data_bytes = data_bytes.trim_ascii();
 
-            if data == "[DONE]" {
-                line_buf.drain(..=newline_pos);
+            if data_bytes == b"[DONE]" {
+                byte_buf.drain(..=newline_pos);
                 return Ok(true);
             }
 
-            let parsed: R =
-                serde_json::from_str(data).map_err(HttpClientError::DeserializationError)?;
+            let parsed: R = serde_json::from_slice(data_bytes)
+                .map_err(HttpClientError::DeserializationError)?;
             chunks.push(parsed);
-            line_buf.drain(..=newline_pos);
+            byte_buf.drain(..=newline_pos);
         }
 
         Ok(false)
@@ -563,7 +573,11 @@ impl<'a> RequestBuilder<'a> {
         let result = self
             .client
             .execute_with_retry(retry_policy, || async {
-                let mut request = self.client.client.request(self.method.clone(), url.clone());
+                let mut request = self
+                    .client
+                    .client
+                    .request(self.method.clone(), url.clone())
+                    .header(ACCEPT, "text/event-stream");
 
                 if let Some(body) = &self.json_body {
                     request = request

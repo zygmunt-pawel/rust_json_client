@@ -1079,3 +1079,68 @@ async fn send_sse_respects_retry_after_on_429() {
     // Retry-After: 1 means we should have waited at least 1 second
     assert!(elapsed >= std::time::Duration::from_millis(900));
 }
+
+#[tokio::test]
+async fn send_sse_handles_crlf_line_endings() {
+    let mock_server = MockServer::start().await;
+
+    let sse_body = "data: {\"id\":1,\"text\":\"crlf\"}\r\n\r\ndata: [DONE]\r\n\r\n";
+
+    Mock::given(method("POST"))
+        .and(path("/stream-crlf"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(sse_body),
+        )
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let client = HttpClient::builder()
+        .base_url(url::Url::parse(&mock_server.uri()).unwrap())
+        .build();
+
+    let payload = serde_json::json!({"stream": true});
+    let chunks: Vec<SseChunk> = client
+        .post("/stream-crlf", &payload)
+        .unwrap()
+        .send_sse()
+        .await
+        .unwrap();
+
+    assert_eq!(chunks.len(), 1);
+    assert_eq!(chunks[0].text, "crlf");
+}
+
+#[tokio::test]
+async fn send_sse_sends_accept_text_event_stream_header() {
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/stream-accept"))
+        .and(header("accept", "text/event-stream"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string("data: {\"id\":1,\"text\":\"accepted\"}\n\ndata: [DONE]\n\n"),
+        )
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let client = HttpClient::builder()
+        .base_url(url::Url::parse(&mock_server.uri()).unwrap())
+        .build();
+
+    let payload = serde_json::json!({"stream": true});
+    let chunks: Vec<SseChunk> = client
+        .post("/stream-accept", &payload)
+        .unwrap()
+        .send_sse()
+        .await
+        .unwrap();
+
+    assert_eq!(chunks.len(), 1);
+    assert_eq!(chunks[0].text, "accepted");
+}
