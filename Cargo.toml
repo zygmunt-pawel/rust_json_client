@@ -2,7 +2,7 @@
 name = "rust_json_client"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.93"
+rust-version = "1.95.0"
 description = "Opinionated async HTTP client for JSON APIs with retries, size limits, and tracing"
 license = "MIT"
 repository = "https://github.com/zygmunt-pawel/rust_json_client"
