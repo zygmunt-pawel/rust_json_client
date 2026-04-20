@@ -19,10 +19,10 @@ bon = "=3.9.1"
 url = "=2.5.8"
 getset = "=0.1.6"
 backon = { version = "=1.6.0", default-features = false, features = ["std", "tokio-sleep"] }
-tokio = { version = "=1.51.1", default-features = false, features = ["time"] }
+tokio = { version = "=1.52.1", default-features = false, features = ["time"] }
 tracing = { version = "=0.1.44", features = ["attributes"] }
 
 [dev-dependencies]
-tokio = { version = "=1.51.1", features = ["macros", "rt-multi-thread", "time"] }
+tokio = { version = "=1.52.1", features = ["macros", "rt-multi-thread", "time"] }
 wiremock = "=0.6.5"
 tracing-subscriber = { version = "=0.3.23", features = ["env-filter", "fmt"] }
