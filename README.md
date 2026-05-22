@@ -6,6 +6,7 @@ Opinionated async HTTP client for JSON APIs built on top of [reqwest](https://do
 
 - Builder pattern for client and retry policy via [bon](https://docs.rs/bon)
 - GET and POST with automatic JSON serialization/deserialization
+- Server-Sent Events (SSE) streaming via `send_sse` — collects `data:` chunks; returns `IncompleteSseStream` when a stream is truncated (ends without `[DONE]`)
 - Automatic retries with exponential backoff and jitter (powered by [backon](https://docs.rs/backon))
 - GET retries inherited from client policy, POST retries opt-in per request
 - Configurable retryable status codes (429, 500, 502, 503, 504 by default)
@@ -33,7 +34,7 @@ Opinionated async HTTP client for JSON APIs built on top of [reqwest](https://do
 
 ```toml
 [dependencies]
-rust_json_client = { git = "https://github.com/zygmunt-pawel/rust_json_client.git", tag = "v0.3.0" }
+rust_json_client = { git = "https://github.com/zygmunt-pawel/rust_json_client.git", tag = "v0.5.0" }
 ```
 
 ## Usage

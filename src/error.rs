@@ -34,4 +34,10 @@ pub enum HttpClientError {
 
     #[error("response body exceeded limit ({received} > {limit} bytes)")]
     ResponseTooLarge { limit: usize, received: usize },
+
+    /// An SSE stream ended without the `[DONE]` terminator — the response was
+    /// truncated (dropped connection / proxy cutoff / server crash mid-stream).
+    /// The accumulated chunks are an incomplete partial response.
+    #[error("SSE stream ended without [DONE] (truncated response)")]
+    IncompleteSseStream,
 }

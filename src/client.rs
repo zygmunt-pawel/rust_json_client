@@ -267,18 +267,15 @@ impl HttpClient {
             }
         }
 
-        // Process any remaining data in the buffer (last line without trailing \n).
-        if !byte_buf.is_empty() {
-            byte_buf.push(b'\n');
-            Self::process_sse_byte_lines(&mut byte_buf, &mut chunks)?;
-        }
-
-        debug!(
+        // Stream ended without the [DONE] sentinel — truncated mid-flight.
+        // `chunks` is a partial response; returning Ok would let a caller
+        // persist half an answer as if it were complete.
+        warn!(
             chunks = chunks.len(),
             bytes = received,
-            "SSE stream ended without [DONE]"
+            "SSE stream ended without [DONE] — truncated"
         );
-        Ok(chunks)
+        Err(HttpClientError::IncompleteSseStream)
     }
 
     /// Parses complete lines from `byte_buf`, deserializes `data:` payloads into

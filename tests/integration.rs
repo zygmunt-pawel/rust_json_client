@@ -922,9 +922,11 @@ async fn send_sse_enforces_max_response_bytes() {
 }
 
 #[tokio::test]
-async fn send_sse_returns_chunks_when_stream_ends_without_done() {
+async fn send_sse_returns_incomplete_error_when_stream_ends_without_done() {
     let mock_server = MockServer::start().await;
 
+    // Two complete chunks, but the stream closes without the `[DONE]` sentinel —
+    // a truncated response (dropped connection / proxy cutoff / server crash).
     let sse_body = "\
         data: {\"id\":1,\"text\":\"first\"}\n\n\
         data: {\"id\":2,\"text\":\"second\"}\n\n";
@@ -945,23 +947,21 @@ async fn send_sse_returns_chunks_when_stream_ends_without_done() {
         .build();
 
     let payload = serde_json::json!({"stream": true});
-    let chunks: Vec<SseChunk> = client
+    let result: Result<Vec<SseChunk>, HttpClientError> = client
         .post("/stream-no-done", &payload)
         .unwrap()
         .send_sse()
-        .await
-        .unwrap();
+        .await;
 
-    assert_eq!(chunks.len(), 2);
-    assert_eq!(chunks[0].text, "first");
-    assert_eq!(chunks[1].text, "second");
+    assert!(matches!(result, Err(HttpClientError::IncompleteSseStream)));
 }
 
 #[tokio::test]
-async fn send_sse_collects_last_chunk_without_trailing_newline() {
+async fn send_sse_returns_incomplete_error_when_stream_truncated_mid_line() {
     let mock_server = MockServer::start().await;
 
-    // Last data line has no trailing \n — simulates server closing connection abruptly.
+    // Last data line has no trailing \n and there is no `[DONE]` — simulates a
+    // server closing the connection abruptly mid-stream.
     let sse_body = "data: {\"id\":1,\"text\":\"first\"}\n\ndata: {\"id\":2,\"text\":\"last\"}";
 
     Mock::given(method("POST"))
@@ -980,16 +980,13 @@ async fn send_sse_collects_last_chunk_without_trailing_newline() {
         .build();
 
     let payload = serde_json::json!({"stream": true});
-    let chunks: Vec<SseChunk> = client
+    let result: Result<Vec<SseChunk>, HttpClientError> = client
         .post("/stream-no-trailing-newline", &payload)
         .unwrap()
         .send_sse()
-        .await
-        .unwrap();
+        .await;
 
-    assert_eq!(chunks.len(), 2);
-    assert_eq!(chunks[0].text, "first");
-    assert_eq!(chunks[1].text, "last");
+    assert!(matches!(result, Err(HttpClientError::IncompleteSseStream)));
 }
 
 #[tokio::test]

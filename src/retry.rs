@@ -54,6 +54,9 @@ impl RetryPolicy {
             HttpClientError::ApiError { status, .. } => {
                 self.retryable_status_codes.contains(status)
             }
+            // A truncated SSE stream is a transient failure — the connection
+            // dropped mid-flight, so retrying may yield a complete response.
+            HttpClientError::IncompleteSseStream => true,
             HttpClientError::SerializationError(_)
             | HttpClientError::DeserializationError(_)
             | HttpClientError::UrlError(_)
@@ -102,6 +105,12 @@ mod tests {
 
         assert!(policy.is_retryable(&retryable));
         assert!(!policy.is_retryable(&not_retryable));
+    }
+
+    #[test]
+    fn incomplete_sse_stream_is_retryable() {
+        let policy = RetryPolicy::builder().build();
+        assert!(policy.is_retryable(&HttpClientError::IncompleteSseStream));
     }
 
     #[test]
