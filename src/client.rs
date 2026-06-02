@@ -203,10 +203,14 @@ impl HttpClient {
         Ok(response)
     }
 
-    async fn handle_json_response<R: DeserializeOwned>(
+    /// Validates the status code and enforces the configured size limit (both the
+    /// `Content-Length` precheck and the streamed byte cap), returning the raw
+    /// response body. Shared prologue for JSON (`handle_json_response`) and raw
+    /// (`send_bytes`) reads.
+    async fn read_checked_body(
         response: Response,
         max_response_bytes: usize,
-    ) -> Result<R, HttpClientError> {
+    ) -> Result<Vec<u8>, HttpClientError> {
         let response = Self::check_error_status(response, max_response_bytes).await?;
         let status = response.status();
 
@@ -225,9 +229,16 @@ impl HttpClient {
             });
         }
 
-        let bytes = Self::read_response_body_limited(response, max_response_bytes).await?;
+        Self::read_response_body_limited(response, max_response_bytes).await
+    }
+
+    async fn handle_json_response<R: DeserializeOwned>(
+        response: Response,
+        max_response_bytes: usize,
+    ) -> Result<R, HttpClientError> {
+        let bytes = Self::read_checked_body(response, max_response_bytes).await?;
         let parsed = Self::deserialize_success_body(&bytes)?;
-        debug!(status = %status, bytes = bytes.len(), "successfully decoded JSON response");
+        debug!(bytes = bytes.len(), "successfully decoded JSON response");
         Ok(parsed)
     }
 
@@ -595,6 +606,69 @@ impl<'a> RequestBuilder<'a> {
         }
 
         result
+    }
+
+    /// Sends the request and returns the raw response body bytes.
+    ///
+    /// Applies the same status-code checks, size limits, and retry handling as
+    /// [`send`](Self::send), but performs no JSON deserialization — for callers
+    /// that parse non-JSON payloads (XML/Atom feeds, plaintext) themselves.
+    /// Unlike [`send`](Self::send), an empty 2xx body is returned as an empty
+    /// `Vec` rather than [`HttpClientError::EmptyResponseBody`]. The `Accept`
+    /// header is taken from the client's default headers (not overridden here).
+    #[instrument(
+        name = "http_client.send_bytes",
+        skip_all,
+        fields(
+            method = %self.method,
+            path = %HttpClient::loggable_path(self.path),
+            retry_enabled = self.retry_policy.is_some()
+        )
+    )]
+    pub async fn send_bytes(self) -> Result<Vec<u8>, HttpClientError> {
+        let retry_policy = self.retry_policy.as_ref();
+        let url = HttpClient::build_request_url(&self.client.base_url, self.path)?;
+        let started_at = Instant::now();
+        debug!("sending HTTP request");
+
+        let result = self
+            .client
+            .execute_with_retry(retry_policy, || async {
+                let mut request = self.client.client.request(self.method.clone(), url.clone());
+
+                if let Some(body) = &self.json_body {
+                    request = request
+                        .header(CONTENT_TYPE, "application/json")
+                        .body(body.clone());
+                }
+
+                let response = request.send().await?;
+                HttpClient::read_checked_body(response, self.client.max_response_bytes).await
+            })
+            .await;
+
+        let elapsed_ms = started_at.elapsed().as_millis() as u64;
+
+        match &result {
+            Ok(bytes) => debug!(
+                elapsed_ms,
+                bytes = bytes.len(),
+                "request completed successfully"
+            ),
+            Err(err) => warn!(elapsed_ms, error = %err, "request failed"),
+        }
+
+        result
+    }
+
+    /// Sends the request and returns the response body decoded as UTF-8.
+    ///
+    /// Thin wrapper over [`send_bytes`](Self::send_bytes) that decodes the bytes
+    /// with [`String::from_utf8_lossy`]: invalid UTF-8 becomes U+FFFD rather than
+    /// a hard error, so a corrupt upstream body surfaces as a downstream parse
+    /// failure instead of failing the request outright.
+    pub async fn send_text(self) -> Result<String, HttpClientError> {
+        Ok(String::from_utf8_lossy(&self.send_bytes().await?).into_owned())
     }
 }
 

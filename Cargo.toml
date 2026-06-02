@@ -1,6 +1,6 @@
 [package]
 name = "rust_json_client"
-version = "0.5.0"
+version = "0.5.1"
 edition = "2024"
 rust-version = "1.93"
 description = "Opinionated async HTTP client for JSON APIs with retries, size limits, and tracing"
@@ -23,6 +23,6 @@ tokio = { version = "=1.52.3", default-features = false, features = ["time"] }
 tracing = { version = "=0.1.44", features = ["attributes"] }
 
 [dev-dependencies]
-tokio = { version = "=1.52.3", features = ["macros", "rt-multi-thread", "time"] }
+tokio = { version = "=1.52.3", features = ["macros", "rt-multi-thread", "time", "net", "io-util"] }
 wiremock = "=0.6.5"
 tracing-subscriber = { version = "=0.3.23", features = ["env-filter", "fmt"] }

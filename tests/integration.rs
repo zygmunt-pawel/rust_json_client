@@ -4,6 +4,8 @@ use serde::{Deserialize, Serialize};
 use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpListener;
 use wiremock::matchers::{body_json, header, method, path};
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
@@ -1140,4 +1142,313 @@ async fn send_sse_sends_accept_text_event_stream_header() {
 
     assert_eq!(chunks.len(), 1);
     assert_eq!(chunks[0].text, "accepted");
+}
+
+// ─── send_text / send_bytes (raw, non-JSON response bodies) ──────────────────
+
+#[tokio::test]
+async fn send_text_returns_raw_body() {
+    let mock_server = MockServer::start().await;
+
+    let atom = "<?xml version=\"1.0\"?><feed><entry><title>hi</title></entry></feed>";
+
+    Mock::given(method("GET"))
+        .and(path("/feed.atom"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "application/atom+xml")
+                .set_body_string(atom),
+        )
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let client = HttpClient::builder()
+        .base_url(url::Url::parse(&mock_server.uri()).unwrap())
+        .build();
+
+    let body: String = client.get("/feed.atom").send_text().await.unwrap();
+
+    assert_eq!(body, atom);
+}
+
+#[tokio::test]
+async fn send_bytes_returns_raw_body() {
+    let mock_server = MockServer::start().await;
+    let raw: Vec<u8> = vec![0, 1, 2, 3, 255, 254, 200];
+
+    Mock::given(method("GET"))
+        .and(path("/binary"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(raw.clone()))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let client = HttpClient::builder()
+        .base_url(url::Url::parse(&mock_server.uri()).unwrap())
+        .build();
+
+    let body: Vec<u8> = client.get("/binary").send_bytes().await.unwrap();
+
+    assert_eq!(body, raw);
+}
+
+#[tokio::test]
+async fn send_text_replaces_invalid_utf8_lossily() {
+    let mock_server = MockServer::start().await;
+    // 0xFF can never appear in valid UTF-8; lossy decoding yields U+FFFD rather
+    // than failing the whole request — a corrupt feed becomes a downstream parse
+    // error (transient skip), never a hard client error.
+    let invalid: Vec<u8> = vec![b'h', b'i', 0xFF];
+
+    Mock::given(method("GET"))
+        .and(path("/bad-utf8"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(invalid))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let client = HttpClient::builder()
+        .base_url(url::Url::parse(&mock_server.uri()).unwrap())
+        .build();
+
+    let body: String = client.get("/bad-utf8").send_text().await.unwrap();
+
+    assert_eq!(body, "hi\u{FFFD}");
+}
+
+#[tokio::test]
+async fn send_text_returns_empty_string_for_empty_body() {
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/empty"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let client = HttpClient::builder()
+        .base_url(url::Url::parse(&mock_server.uri()).unwrap())
+        .build();
+
+    // Unlike `send`, an empty 2xx body is not an error for raw reads — it is an
+    // empty string (0 entries downstream), not `EmptyResponseBody`.
+    let body: String = client.get("/empty").send_text().await.unwrap();
+
+    assert_eq!(body, "");
+}
+
+#[tokio::test]
+async fn send_bytes_returns_api_error_on_non_success() {
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/missing"))
+        .respond_with(ResponseTemplate::new(404).set_body_string("not found"))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let client = HttpClient::builder()
+        .base_url(url::Url::parse(&mock_server.uri()).unwrap())
+        .build();
+
+    let result = client.get("/missing").send_bytes().await;
+
+    assert!(matches!(
+        result,
+        Err(HttpClientError::ApiError {
+            status: StatusCode::NOT_FOUND,
+            ..
+        })
+    ));
+}
+
+#[tokio::test]
+async fn send_bytes_enforces_max_response_bytes() {
+    let mock_server = MockServer::start().await;
+    let large = "x".repeat(16 * 1024);
+
+    Mock::given(method("GET"))
+        .and(path("/large-raw"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(large))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let client = HttpClient::builder()
+        .base_url(url::Url::parse(&mock_server.uri()).unwrap())
+        .max_response_bytes(1024)
+        .build();
+
+    let result = client.get("/large-raw").send_bytes().await;
+
+    assert!(matches!(
+        result,
+        Err(HttpClientError::ResponseTooLarge { limit: 1024, .. })
+    ));
+}
+
+#[tokio::test]
+async fn send_text_uses_accept_header_from_default_headers() {
+    let mock_server = MockServer::start().await;
+
+    // send_text must NOT hardcode an Accept header (unlike send_sse) — it honours
+    // whatever the caller configured via default_headers.
+    Mock::given(method("GET"))
+        .and(path("/feed"))
+        .and(header("accept", "application/atom+xml"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("<feed/>"))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(
+        reqwest::header::ACCEPT,
+        "application/atom+xml".parse().unwrap(),
+    );
+
+    let client = HttpClient::builder()
+        .base_url(url::Url::parse(&mock_server.uri()).unwrap())
+        .default_headers(headers)
+        .build();
+
+    let body: String = client.get("/feed").send_text().await.unwrap();
+
+    assert_eq!(body, "<feed/>");
+}
+
+#[tokio::test]
+async fn send_text_retries_on_transient_error_using_client_policy() {
+    let mock_server = MockServer::start().await;
+    let attempts = Arc::new(AtomicUsize::new(0));
+
+    Mock::given(method("GET"))
+        .and(path("/retry-text"))
+        .respond_with({
+            let attempts = attempts.clone();
+            move |_request: &Request| {
+                let attempt = attempts.fetch_add(1, Ordering::SeqCst);
+                if attempt == 0 {
+                    ResponseTemplate::new(503).set_body_string("temporary failure")
+                } else {
+                    ResponseTemplate::new(200).set_body_string("<feed>ok</feed>")
+                }
+            }
+        })
+        .expect(2)
+        .mount(&mock_server)
+        .await;
+
+    let retry_policy = rust_json_client::RetryPolicy::builder()
+        .max_attempts(NonZeroU32::new(2).unwrap())
+        .base_delay(std::time::Duration::from_millis(10))
+        .build();
+
+    let client = HttpClient::builder()
+        .base_url(url::Url::parse(&mock_server.uri()).unwrap())
+        .retry_policy(retry_policy)
+        .build();
+
+    let body: String = client.get("/retry-text").send_text().await.unwrap();
+
+    assert_eq!(body, "<feed>ok</feed>");
+    assert_eq!(attempts.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn post_send_bytes_includes_json_body() {
+    let mock_server = MockServer::start().await;
+    let payload = serde_json::json!({ "q": "rust" });
+
+    Mock::given(method("POST"))
+        .and(path("/search"))
+        .and(body_json(&payload))
+        .respond_with(ResponseTemplate::new(200).set_body_string("<results/>"))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let client = HttpClient::builder()
+        .base_url(url::Url::parse(&mock_server.uri()).unwrap())
+        .build();
+
+    let bytes = client
+        .post("/search", &payload)
+        .unwrap()
+        .send_bytes()
+        .await
+        .unwrap();
+
+    assert_eq!(String::from_utf8_lossy(&bytes), "<results/>");
+}
+
+/// Spawns a one-shot raw HTTP/1.1 server that replies with a chunked body (no
+/// `Content-Length`) that keeps streaming past `min_bytes`. wiremock always sets
+/// `Content-Length`, which trips the precheck before streaming begins — this lets
+/// a test drive the streamed byte-cap in `read_response_body_limited` instead.
+async fn spawn_chunked_oversize_server(min_bytes: usize) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        let Ok((mut socket, _)) = listener.accept().await else {
+            return;
+        };
+
+        // Drain the request so the client finishes writing before we respond.
+        let mut buf = [0u8; 1024];
+        let _ = socket.read(&mut buf).await;
+
+        if socket
+            .write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n")
+            .await
+            .is_err()
+        {
+            return;
+        }
+
+        let chunk = "x".repeat(512);
+        let frame = format!("{:x}\r\n{}\r\n", chunk.len(), chunk);
+        let mut sent = 0usize;
+        while sent <= min_bytes {
+            // Once the client hits its cap it drops the connection; the resulting
+            // write error is expected, so we just stop.
+            if socket.write_all(frame.as_bytes()).await.is_err() {
+                return;
+            }
+            sent += chunk.len();
+        }
+        let _ = socket.write_all(b"0\r\n\r\n").await;
+    });
+
+    format!("http://{addr}")
+}
+
+#[tokio::test]
+async fn send_bytes_enforces_max_response_bytes_on_chunked_stream_without_content_length() {
+    // No Content-Length means the precheck in read_checked_body cannot fire, so
+    // this exercises the streamed byte-cap in read_response_body_limited directly —
+    // the realistic enforcement path for a chunked feed read via send_bytes.
+    let base = spawn_chunked_oversize_server(8 * 1024).await;
+
+    let client = HttpClient::builder()
+        .base_url(url::Url::parse(&base).unwrap())
+        .max_response_bytes(1024)
+        .build();
+
+    let result = client.get("/stream").send_bytes().await;
+
+    match result {
+        Err(HttpClientError::ResponseTooLarge { limit, received }) => {
+            assert_eq!(limit, 1024);
+            assert!(
+                received > limit,
+                "streamed cap should report received ({received}) > limit ({limit})"
+            );
+        }
+        other => panic!("expected ResponseTooLarge from streamed cap, got {other:?}"),
+    }
 }
