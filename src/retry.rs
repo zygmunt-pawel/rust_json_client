@@ -57,6 +57,9 @@ impl RetryPolicy {
             // A truncated SSE stream is a transient failure — the connection
             // dropped mid-flight, so retrying may yield a complete response.
             HttpClientError::IncompleteSseStream => true,
+            // A stalled stream is transient — the upstream went quiet but the
+            // connection is alive; a retry may land on a healthy upstream.
+            HttpClientError::SseIdleTimeout => true,
             HttpClientError::SerializationError(_)
             | HttpClientError::DeserializationError(_)
             | HttpClientError::UrlError(_)
@@ -111,6 +114,12 @@ mod tests {
     fn incomplete_sse_stream_is_retryable() {
         let policy = RetryPolicy::builder().build();
         assert!(policy.is_retryable(&HttpClientError::IncompleteSseStream));
+    }
+
+    #[test]
+    fn sse_idle_timeout_is_retryable() {
+        let policy = RetryPolicy::builder().build();
+        assert!(policy.is_retryable(&HttpClientError::SseIdleTimeout));
     }
 
     #[test]

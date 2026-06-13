@@ -40,4 +40,11 @@ pub enum HttpClientError {
     /// The accumulated chunks are an incomplete partial response.
     #[error("SSE stream ended without [DONE] (truncated response)")]
     IncompleteSseStream,
+
+    /// An SSE stream stalled: no chunk arrived within the configured
+    /// `sse_idle_timeout` while the connection stayed open (the upstream
+    /// stopped emitting mid-stream). Distinct from `IncompleteSseStream`,
+    /// where the connection closed without the `[DONE]` terminator.
+    #[error("SSE stream idle timeout (no chunk within configured window)")]
+    SseIdleTimeout,
 }
