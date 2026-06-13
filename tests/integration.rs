@@ -1509,8 +1509,9 @@ async fn send_sse_times_out_on_idle_stream() {
 
     // Outer guard: before the idle wrap exists, send_sse hangs; this turns that
     // into a fast, clear failure instead of a hung run. Once implemented, the
-    // 500ms idle timeout fires far inside this 5s window (the margin over 200ms
-    // absorbs scheduler latency on a loaded CI box without making the test slow).
+    // 500ms idle timeout fires far inside this 5s window (the ~10x margin between
+    // the idle bound and the guard absorbs scheduler latency on a loaded CI box
+    // without making the test slow).
     let result = tokio::time::timeout(std::time::Duration::from_secs(5), async {
         client
             .post("/stream", &payload)
