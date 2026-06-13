@@ -31,9 +31,7 @@ pub struct HttpClient {
     #[cfg_attr(not(test), allow(dead_code))]
     pool_max_idle_per_host: usize,
     // Per-chunk idle timeout for SSE streams (`send_sse`); `None` = no
-    // inter-chunk bound. Only read by tests until wired into the SSE loop, so
-    // it is dead in non-test builds for now (Task 3 removes this attribute).
-    #[cfg_attr(not(test), allow(dead_code))]
+    // inter-chunk bound.
     sse_idle_timeout: Option<Duration>,
 }
 
@@ -252,6 +250,7 @@ impl HttpClient {
     async fn handle_sse_response<R: DeserializeOwned>(
         mut response: Response,
         max_response_bytes: usize,
+        sse_idle_timeout: Option<Duration>,
     ) -> Result<Vec<R>, HttpClientError> {
         response = Self::check_error_status(response, max_response_bytes).await?;
 
@@ -259,7 +258,18 @@ impl HttpClient {
         let mut byte_buf: Vec<u8> = Vec::new();
         let mut received = 0usize;
 
-        while let Some(chunk) = response.chunk().await? {
+        loop {
+            // Bound the inter-chunk gap (resets after every chunk), not the
+            // total stream time: a still-open but stalled upstream aborts here
+            // instead of blocking forever. `None` keeps the original behavior.
+            let next = match sse_idle_timeout {
+                Some(idle) => tokio::time::timeout(idle, response.chunk())
+                    .await
+                    .map_err(|_| HttpClientError::SseIdleTimeout)??,
+                None => response.chunk().await?,
+            };
+            let Some(chunk) = next else { break };
+
             received += chunk.len();
 
             if received > max_response_bytes {
@@ -601,7 +611,12 @@ impl<'a> RequestBuilder<'a> {
                 }
 
                 let response = request.send().await?;
-                HttpClient::handle_sse_response(response, self.client.max_response_bytes).await
+                HttpClient::handle_sse_response(
+                    response,
+                    self.client.max_response_bytes,
+                    self.client.sse_idle_timeout,
+                )
+                .await
             })
             .await;
 

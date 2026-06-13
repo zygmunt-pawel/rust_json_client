@@ -1452,3 +1452,74 @@ async fn send_bytes_enforces_max_response_bytes_on_chunked_stream_without_conten
         other => panic!("expected ResponseTooLarge from streamed cap, got {other:?}"),
     }
 }
+
+/// Spawns a one-shot raw HTTP/1.1 server that sends SSE headers plus one
+/// complete `data:` chunk, then holds the connection open without sending more
+/// or closing it — simulating an upstream that stalled mid-stream (the failure
+/// mode a total `request_timeout` does not catch). wiremock cannot model
+/// "partial body then hang", so this is driven over a raw socket, mirroring
+/// `spawn_chunked_oversize_server`.
+async fn spawn_stalling_sse_server() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        let Ok((mut socket, _)) = listener.accept().await else {
+            return;
+        };
+
+        // Drain the request so the client finishes writing before we respond.
+        let mut buf = [0u8; 1024];
+        let _ = socket.read(&mut buf).await;
+
+        let head = "HTTP/1.1 200 OK\r\n\
+                    Content-Type: text/event-stream\r\n\
+                    Transfer-Encoding: chunked\r\n\r\n";
+        if socket.write_all(head.as_bytes()).await.is_err() {
+            return;
+        }
+
+        // One complete SSE chunk frame (no `[DONE]`), then stall.
+        let data = "data: {\"id\":1,\"text\":\"partial\"}\n\n";
+        let frame = format!("{:x}\r\n{}\r\n", data.len(), data);
+        if socket.write_all(frame.as_bytes()).await.is_err() {
+            return;
+        }
+
+        // Hold the connection open (no further chunks, no close) well past the
+        // client's idle timeout.
+        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+    });
+
+    format!("http://{addr}")
+}
+
+#[tokio::test]
+async fn send_sse_times_out_on_idle_stream() {
+    let base = spawn_stalling_sse_server().await;
+
+    let client = HttpClient::builder()
+        .base_url(url::Url::parse(&base).unwrap())
+        .sse_idle_timeout(std::time::Duration::from_millis(200))
+        .build();
+
+    let payload = serde_json::json!({"stream": true});
+
+    // Outer guard: before the idle wrap exists, send_sse hangs; this turns that
+    // into a fast, clear failure instead of a hung run. Once implemented, the
+    // 200ms idle timeout fires far inside this 5s window.
+    let result = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        client
+            .post("/stream", &payload)
+            .unwrap()
+            .send_sse::<SseChunk>()
+            .await
+    })
+    .await
+    .expect("send_sse did not return within 5s — idle timeout not firing");
+
+    assert!(
+        matches!(result, Err(HttpClientError::SseIdleTimeout)),
+        "expected SseIdleTimeout, got {result:?}"
+    );
+}
