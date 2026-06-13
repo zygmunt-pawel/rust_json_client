@@ -934,7 +934,7 @@ dependencies = [
 
 [[package]]
 name = "rust_json_client"
-version = "0.5.2"
+version = "0.5.3"
 dependencies = [
  "backon",
  "bon",
