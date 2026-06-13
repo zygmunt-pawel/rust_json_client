@@ -25,6 +25,7 @@ Opinionated async HTTP client for JSON APIs built on top of [reqwest](https://do
 - `Send + Sync` compile-time guarantee on `HttpClient`
 - Default headers support
 - Configurable connect/request timeouts (5s / 30s defaults)
+- Optional per-chunk SSE idle timeout (`sse_idle_timeout`) — aborts a stalled stream when the gap between chunks exceeds the bound (retryable); default off
 - Configurable connection pool (idle timeout, max idle per host — default 64)
 - TLS via rustls (no OpenSSL dependency)
 - HTTP/2 support
@@ -116,6 +117,7 @@ let client = HttpClient::builder()
     .base_url(Url::parse("https://api.example.com/v1")?)
     .connect_timeout(Duration::from_secs(3))
     .request_timeout(Duration::from_secs(10))
+    .sse_idle_timeout(Duration::from_secs(60)) // abort an SSE stream if a chunk gap exceeds 60s
     .max_response_bytes(1024 * 1024)       // 1 MB response limit
     .pool_idle_timeout(Duration::from_secs(30))
     .pool_max_idle_per_host(32)
