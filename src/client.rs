@@ -30,6 +30,11 @@ pub struct HttpClient {
     pool_idle_timeout: Duration,
     #[cfg_attr(not(test), allow(dead_code))]
     pool_max_idle_per_host: usize,
+    // Per-chunk idle timeout for SSE streams (`send_sse`); `None` = no
+    // inter-chunk bound. Only read by tests until wired into the SSE loop, so
+    // it is dead in non-test builds for now (Task 3 removes this attribute).
+    #[cfg_attr(not(test), allow(dead_code))]
+    sse_idle_timeout: Option<Duration>,
 }
 
 const _: () = {
@@ -62,6 +67,7 @@ impl HttpClient {
         #[builder(default = DEFAULT_POOL_MAX_IDLE_PER_HOST)] pool_max_idle_per_host: usize,
         #[builder(default = Duration::from_secs(5))] connect_timeout: Duration,
         #[builder(default = Duration::from_secs(30))] request_timeout: Duration,
+        sse_idle_timeout: Option<Duration>,
     ) -> Self {
         let scheme = base_url.scheme();
         assert!(
@@ -96,6 +102,7 @@ impl HttpClient {
             max_response_bytes,
             pool_idle_timeout,
             pool_max_idle_per_host,
+            sse_idle_timeout,
         }
     }
 
@@ -747,6 +754,23 @@ mod tests {
 
         assert_eq!(client.pool_idle_timeout, Duration::from_secs(15));
         assert_eq!(client.pool_max_idle_per_host, 32);
+    }
+
+    #[test]
+    fn builder_has_no_sse_idle_timeout_by_default() {
+        let base = Url::parse("https://example.com").unwrap();
+        let client = HttpClient::builder().base_url(base).build();
+        assert!(client.sse_idle_timeout.is_none());
+    }
+
+    #[test]
+    fn builder_can_set_sse_idle_timeout() {
+        let base = Url::parse("https://example.com").unwrap();
+        let client = HttpClient::builder()
+            .base_url(base)
+            .sse_idle_timeout(Duration::from_secs(60))
+            .build();
+        assert_eq!(client.sse_idle_timeout, Some(Duration::from_secs(60)));
     }
 
     #[test]
