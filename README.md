@@ -124,6 +124,31 @@ let client = HttpClient::builder()
     .build();
 ```
 
+### SSE streaming
+
+`send_sse` consumes a `text/event-stream` response, deserializing each `data:` payload into your type and stopping at the `[DONE]` sentinel. Pair it with `sse_idle_timeout` so a stalled-but-open upstream aborts instead of hanging: the bound is the gap *between* chunks and resets on every chunk, independent of the total `request_timeout`. A stall returns the retryable `HttpClientError::SseIdleTimeout`, so a configured retry policy can recover automatically.
+
+```rust
+use rust_json_client::HttpClient;
+use serde::Deserialize;
+use std::time::Duration;
+
+#[derive(Deserialize)]
+struct StreamChunk {
+    text: String,
+}
+
+let client = HttpClient::builder()
+    .base_url(Url::parse("https://api.example.com/v1")?)
+    .sse_idle_timeout(Duration::from_secs(30)) // abort if no chunk arrives for 30s
+    .build();
+
+let chunks: Vec<StreamChunk> = client
+    .post("/chat/completions", &request)?
+    .send_sse()
+    .await?;
+```
+
 ### Error handling
 
 ```rust
