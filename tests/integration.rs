@@ -1469,6 +1469,8 @@ async fn spawn_stalling_sse_server() -> String {
         };
 
         // Drain the request so the client finishes writing before we respond.
+        // A single read suffices here: this test's POST body + headers fit well
+        // under 1024 bytes (a larger body would need a loop to avoid deadlock).
         let mut buf = [0u8; 1024];
         let _ = socket.read(&mut buf).await;
 
@@ -1500,14 +1502,15 @@ async fn send_sse_times_out_on_idle_stream() {
 
     let client = HttpClient::builder()
         .base_url(url::Url::parse(&base).unwrap())
-        .sse_idle_timeout(std::time::Duration::from_millis(200))
+        .sse_idle_timeout(std::time::Duration::from_millis(500))
         .build();
 
     let payload = serde_json::json!({"stream": true});
 
     // Outer guard: before the idle wrap exists, send_sse hangs; this turns that
     // into a fast, clear failure instead of a hung run. Once implemented, the
-    // 200ms idle timeout fires far inside this 5s window.
+    // 500ms idle timeout fires far inside this 5s window (the margin over 200ms
+    // absorbs scheduler latency on a loaded CI box without making the test slow).
     let result = tokio::time::timeout(std::time::Duration::from_secs(5), async {
         client
             .post("/stream", &payload)
